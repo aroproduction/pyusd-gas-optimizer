@@ -18,13 +18,29 @@ const API_BASE_URL = '/api';
 function GasHistory() {
   const [chartData, setChartData] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
   const chartRef = useRef(null);
 
   const fetchHistory = async () => {
     try {
       setLoading(true);
+      setError(null);
       const response = await fetch(`${API_BASE_URL}/gas/history?limit=50`);
+      
+      if (!response.ok) {
+        throw new Error(`Server returned ${response.status}: ${response.statusText}`);
+      }
+      
       const data = await response.json();
+      
+      if (data.error) {
+        throw new Error(data.error);
+      }
+      
+      if (!data.history || data.history.length === 0) {
+        throw new Error("No historical data available");
+      }
+      
       const history = data.history.reverse(); // Ascending order
       
       const labels = history.map(entry => {
@@ -50,6 +66,8 @@ function GasHistory() {
       });
     } catch (error) {
       console.error('Error fetching gas history:', error);
+      setError(error.message || "Failed to load gas history");
+      setChartData(null);
     } finally {
       setLoading(false);
     }
@@ -96,6 +114,11 @@ function GasHistory() {
       <h2>Historical Gas Prices</h2>
       {loading ? (
         <p>Loading chart...</p>
+      ) : error ? (
+        <div className="error-container">
+          <p className="error">{error}</p>
+          <button onClick={fetchHistory} className="refresh-button">Try Again</button>
+        </div>
       ) : chartData ? (
         <Line ref={chartRef} data={chartData} options={options} />
       ) : (

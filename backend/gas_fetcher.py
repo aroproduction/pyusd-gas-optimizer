@@ -1,126 +1,200 @@
-from web3 import Web3
-from config import RPC_URL
-from sklearn.ensemble import RandomForestRegressor
-import pandas as pd
+import os
+import json
+import time
+import requests
 import numpy as np
+import pandas as pd
+import pickle
+from datetime import datetime, timedelta
+from dotenv import load_dotenv
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_absolute_error
 from db import GasDatabase
 from config import DB_FILE
 
-# Minimal ERC-20 ABI for PYUSD
-PYUSD_ABI = [
-    {"constant": False, "inputs": [{"name": "_to", "type": "address"}, {"name": "_value", "type": "uint256"}], "name": "transfer", "outputs": [{"name": "", "type": "bool"}], "type": "function"}
-]
-PYUSD_ADDRESS = "0x6c3ea9036406852006290770BEdFcAbA0e23A0e8"
+load_dotenv()
 
 class GasFetcher:
-    def __init__(self):
-        self.w3 = Web3(Web3.HTTPProvider(RPC_URL))
-        if not self.w3.is_connected():
-            raise Exception("Failed to connect to Ethereum Mainnet")
-        self.pyusd_contract = self.w3.eth.contract(address=PYUSD_ADDRESS, abi=PYUSD_ABI)
-        self.db = GasDatabase(DB_FILE)
+    def __init__(self, db_path=DB_FILE):
+        self.db = GasDatabase(db_path)
+        self.rpc_url = os.getenv('GCP_RPC_URL')
+        if not self.rpc_url:
+            raise ValueError("GCP_RPC_URL environment variable is not set")
+        
         self.model = None
         self.train_model()
-
-    def get_current_gas_price(self):
-        gas_price_wei = self.w3.eth.gas_price
-        return float(self.w3.from_wei(gas_price_wei, 'gwei'))
-
-    def estimate_transaction_cost(self, pyusd_amount, sender_address=None):
-        amount_wei = int(pyusd_amount * 10**6)
-        if sender_address is None:
-            sender_address = "0x264bd8291fAE1D75DB2c5F573b07faA6715997B5"
-        tx = {
-            "from": sender_address,
-            "to": PYUSD_ADDRESS,
-            "data": self.pyusd_contract.encodeABI(fn_name="transfer", args=[sender_address, amount_wei]),
-            "chainId": 1,
-            "gasPrice": self.w3.eth.gas_price,
-            "nonce": self.w3.eth.get_transaction_count(sender_address),
+    
+    def make_rpc_call(self, method, params=None):
+        """Make a direct RPC call to the Ethereum node via GCP."""
+        if params is None:
+            params = []
+        
+        headers = {
+            'Content-Type': 'application/json',
         }
+        
+        payload = {
+            'jsonrpc': '2.0',
+            'method': method,
+            'params': params,
+            'id': int(time.time() * 1000),  # Use timestamp as ID
+        }
+        
         try:
-            gas_estimate = self.w3.eth.estimate_gas(tx)
+            response = requests.post(self.rpc_url, headers=headers, json=payload, timeout=10)
+            response.raise_for_status()
+            result = response.json()
+            
+            if 'error' in result:
+                raise ValueError(f"RPC Error: {result['error']}")
+            
+            return result.get('result')
         except Exception as e:
-            gas_estimate = 50000
-            print(f"Gas estimation failed: {e}. Using fallback: {gas_estimate}")
-        gas_price_wei = self.w3.eth.gas_price
-        cost_wei = gas_estimate * gas_price_wei
-        return float(self.w3.from_wei(cost_wei, 'ether'))
+            print(f"RPC call failed: {str(e)}")
+            return None
+    
+    def get_current_gas_price(self):
+        """Get current gas price directly with eth_gasPrice RPC method."""
+        result = self.make_rpc_call('eth_gasPrice')
+        if result:
+            # Convert hex result to Gwei
+            wei_gas_price = int(result, 16)
+            gwei_gas_price = wei_gas_price / 1e9
+            return round(gwei_gas_price, 4)
+        return None
 
+    def get_pyusd_transfer_gas(self, from_address, to_address, amount):
+        """Estimate gas for PYUSD transfer with eth_estimateGas."""
+        # PYUSD contract address on mainnet
+        pyusd_contract = "0xCaC524BcA292aaade2DF8A05cC58F0a65B1B3bB9"
+        
+        # Create the transfer function data
+        # transfer(address,uint256)
+        function_selector = "0xa9059cbb"
+        
+        # Format to_address - remove 0x prefix and pad to 32 bytes
+        to_param = to_address[2:].zfill(64)
+        
+        # Convert amount to wei (assuming 6 decimals for PYUSD) and format to 32 bytes
+        amount_in_smallest_unit = int(amount * 10**6)
+        amount_param = hex(amount_in_smallest_unit)[2:].zfill(64)
+        
+        # Combine function selector and parameters
+        data = function_selector + to_param + amount_param
+        
+        # Prepare transaction parameters for gas estimation
+        tx_params = {
+            "from": from_address,
+            "to": pyusd_contract,
+            "data": "0x" + data
+        }
+        
+        result = self.make_rpc_call('eth_estimateGas', [tx_params])
+        if result:
+            return int(result, 16)
+        
+        # Default gas limit if estimation fails
+        return 100000
+
+    def fetch_and_save_gas_price(self):
+        """Fetch current gas price and save to database."""
+        gas_price = self.get_current_gas_price()
+        if gas_price:
+            self.db.save_gas_price(gas_price)
+            return gas_price
+        return None
+    
+    def get_historical_data(self, limit=50):
+        """Get historical gas prices from database."""
+        return self.db.get_historical_data(limit)
+    
     def train_model(self):
-        history = self.db.get_historical_data(limit=1000)
-        if len(history) < 6:
-            print(f"Not enough data to train model: {len(history)} entries found")
-            self.model = None
-            return
-
-        df = pd.DataFrame(history)
-        if len(df.columns) != 2:
-            print(f"Unexpected data format: {df.columns}")
-            self.model = None
+        """Train a machine learning model for gas price prediction."""
+        history = self.db.get_historical_data(limit=1000)  # Get substantial history
+        if len(history) < 50:  # Need enough data to train
+            print("Insufficient data for model training")
             return
         
+        df = pd.DataFrame(history)
         df.columns = ['timestamp', 'gas_price']
         df['timestamp'] = pd.to_datetime(df['timestamp'])
+        
+        # Feature engineering
         df['hour'] = df['timestamp'].dt.hour
         df['day_of_week'] = df['timestamp'].dt.dayofweek
-    
-        for i in range(1, 6):
+        
+        # Create lag features - gas prices from previous times
+        for i in range(1, 6):  # 5 previous prices
             df[f'lag_{i}'] = df['gas_price'].shift(i)
-    
+        
+        # Drop rows with NaN values (first 5 rows with lag features)
         df = df.dropna()
-        if len(df) == 0:
-            print("No valid training data after preprocessing")
-            self.model = None
-            return
-    
-        X = df[['hour', 'day_of_week', 'lag_1', 'lag_2', 'lag_3', 'lag_4', 'lag_5']]
+        
+        # Prepare features and target
+        features = ['hour', 'day_of_week', 'lag_1', 'lag_2', 'lag_3', 'lag_4', 'lag_5']
+        X = df[features]
         y = df['gas_price']
-    
+        
+        # Train model
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
         self.model = RandomForestRegressor(n_estimators=100, random_state=42)
-        self.model.fit(X, y)
-        print(f"Gas price prediction model trained with {len(df)} samples")
-
+        self.model.fit(X_train, y_train)
+        
+        # Evaluate model
+        y_pred = self.model.predict(X_test)
+        mae = mean_absolute_error(y_test, y_pred)
+        print(f"Model trained with MAE: {mae:.2f} Gwei")
+    
     def predict_next_gas_prices(self, steps=6):
+        """Predict gas prices for the next few periods (30 min increments)."""
         if not self.model:
             return None
-    
-        history = self.db.get_historical_data(limit=5 + steps - 1)  # Enough data for lags
+
+        history = self.db.get_historical_data(limit=5)  # We only need the last 5 prices for lag features
         if len(history) < 5:
             return None
-    
+
         df = pd.DataFrame(history)
         df.columns = ['timestamp', 'gas_price']
         df['timestamp'] = pd.to_datetime(df['timestamp'])
         
         predictions = []
-        current_lags = list(df['gas_price'].values[-5:][::-1])  # Last 5 prices in reverse order
-        latest = df.iloc[-1]
+        current_lags = list(df['gas_price'].values[:5][::-1])  # Last 5 prices in reverse order
+        
+        # Use current time as starting point for predictions
+        current_time = pd.Timestamp.now(tz='UTC')
         
         for step in range(steps):
-            next_hour = (latest['timestamp'].hour + (step + 1)) % 24
-            next_day = (latest['timestamp'].dayofweek + (latest['timestamp'].hour + step + 1) // 24) % 7
+            next_hour = (current_time.hour + (step * 0.5)) % 24  # Half hour increments
+            next_day = (current_time.dayofweek + (current_time.hour + (step * 0.5)) // 24) % 7
             features = np.array([[next_hour, next_day, *current_lags]])
             prediction = self.model.predict(features)[0]
             
-            # Create timestamp with proper UTC handling
-            next_timestamp = latest['timestamp'] + pd.Timedelta(minutes=30 * (step + 1))
-            
-            # Check if timestamp already has timezone info
-            if next_timestamp.tzinfo is None:
-                utc_timestamp = next_timestamp.tz_localize('UTC').isoformat()
-            else:
-                utc_timestamp = next_timestamp.isoformat()
+            # Create future timestamp based on current time
+            next_timestamp = current_time + pd.Timedelta(minutes=30 * step)
+            utc_timestamp = next_timestamp.isoformat()
             
             predictions.append({
                 'timestamp': utc_timestamp,
                 'gas_price': float(prediction)
             })
-            # Update lags for next prediction
-            current_lags.pop(0)  # Remove oldest
-            current_lags.append(prediction)  # Add new prediction
+            
+            # Update lags for next prediction (drop oldest, add newest)
+            current_lags.pop(0)
+            current_lags.append(prediction)
         
         return predictions
+
+    def get_eth_price_usd(self):
+        """Get the current ETH price in USD using a public API."""
+        try:
+            response = requests.get('https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd')
+            data = response.json()
+            return data['ethereum']['usd']
+        except Exception as e:
+            print(f"Failed to fetch ETH price: {e}")
+            return 3000  # Fallback price if API call fails
 
 if __name__ == "__main__":
     fetcher = GasFetcher()
